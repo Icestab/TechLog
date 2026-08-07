@@ -1,6 +1,6 @@
 ---
 title: "Hugo + PaperMod 博客搭建记录(含踩坑)"
-date: 2026-08-06T21:30:00+08:00
+date: 2026-08-07T03:30:00+08:00
 tags: ["Hugo", "PaperMod", "博客", "搭建"]
 categories: ["技术实践"]
 draft: false
@@ -115,6 +115,62 @@ hugo server --bind 0.0.0.0 --port <port> --baseURL http://<宿主机IP>:<port>/
 
 **坑**:baseURL 写成 localhost → 页面链接全是 localhost,容器外访问跳转失败。必须用宿主机 IP(具体 IP 按实际环境替换,勿在文章中暴露真实内网地址)。
 
+**坑**:hugo server 的 baseURL 用线上域名时,本地预览的链接会跳转到线上——本地预览必须用本地 baseURL,线上构建用线上 baseURL,两者分开。
+
+## 上线 GitHub Pages(自定义域名)
+
+### 1. 推送流程
+
+```bash
+git init && git add -A && git commit -m "init"
+git remote add origin git@github.com:<用户>/<仓库>.git
+git push -u origin main
+```
+
+**坑**:`git clone` 拉的主题(PaperMod)会被当作 embedded git repository(子模块,160000 模式)——删除 `themes/PaperMod/.git` 后重新 add,主题才作为普通文件提交。
+
+### 2. 自动部署(GitHub Actions)
+
+`.github/workflows/deploy.yml`:
+- `actions/checkout@v4` + `peaceiris/actions-hugo@v3`(hugo-version 指定)
+- `hugo --minify --baseURL "<线上URL>"`
+- `actions/upload-pages-artifact@v3` + `actions/deploy-pages@v4`
+- 触发:push main
+
+**坑**:首次运行前必须在 GitHub **Settings → Pages → Source 选 GitHub Actions**,否则 deploy 步骤报 Environment 不存在。
+
+### 3. 自定义域名
+
+- DNS 加 CNAME 记录:`<子域>` → `<用户>.github.io.`
+- GitHub Pages 设置里填自定义域名 + 勾选 **Enforce HTTPS**(自动签发证书,首次等几分钟)
+- **⚠️ 改域名必须同步改 baseURL**(config.toml + Actions workflow 里两处),否则 CSS/JS 链接指向旧域名,页面只有文字没有样式
+
+### 4. Deploy Key(推荐)
+
+SSH key 加到仓库 **Settings → Deploy keys**(不是个人 SSH keys)——只授权单仓库,更安全。**必须勾选 Allow write access**,否则 push 被拒。
+
+**坑**:容器内 hermes 用户的 SSH 家目录是 `/opt/data/.ssh`(passwd 定义),不是 `$HOME`——key 放错位置会 Permission denied。
+
+## 界面定制
+
+### 中文界面
+
+config.toml 加 `defaultContentLanguage = "zh"`(Hugo 0.158+ 废弃 languageCode,用这个才启用中文 i18n):
+- 界面文案(Home→主页、阅读时间等)自动中文化
+- 自定义翻译加到 `themes/PaperMod/i18n/zh.yaml`(如 `posts → 文章`)
+
+### 面包屑定制(覆盖模板)
+
+站点 `layouts/` 下建同名模板优先级高于主题,主题升级不丢:
+- `layouts/_partials/breadcrumbs.html`:自定义面包屑结构
+- `layouts/single.html`:控制单页是否显示面包屑(如 About 页排除)
+
+**坑**:用 `.Section` 判断目录 + i18n 键,不要硬编码英文标题字符串(脆弱);判断页面用 `.RelPermalink` 而非 `.Title`。
+
+### 导航菜单
+
+config.toml 的 `[[menu.main]]` 按 weight 排序(小在前),可加外部链接(如 GitHub 仓库)。
+
 ## 结论
 
-Hugo + PaperMod 搭建快(30 分钟内),坑集中在:配置文件冲突、TOML 语法、日期格式、容器端口。记录在案,下次 20 分钟搞定。
+Hugo + PaperMod 搭建快(30 分钟内),坑集中在:配置文件冲突、TOML 语法、日期格式、容器端口、GitHub Pages 部署、模板定制。记录在案,下次 20 分钟搞定。
