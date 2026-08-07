@@ -6,8 +6,6 @@ categories: ["技术实践"]
 draft: false
 ---
 
-# Hermes Dashboard 修改密码:配置热更新技巧
-
 > 修改 Hermes Dashboard 的登录密码,不需要重启整个容器——改配置 + kill 进程即可,QQ 会话不断线。
 
 ## 背景
