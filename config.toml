@@ -42,6 +42,18 @@ enableEmoji = true
   url = "/tags/"
   weight = 30
 
+[[menu.main]]
+  identifier = "about"
+  name = "关于"
+  url = "/about/"
+  weight = 40
+
+[[menu.main]]
+  identifier = "github"
+  name = "GitHub"
+  url = "https://github.com/Icestab/TechLog"
+  weight = 50
+
 [outputs]
   home = ["HTML", "RSS", "JSON"]
 
