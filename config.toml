@@ -1,0 +1,49 @@
+baseURL = "https://example.github.io/techlog/"
+languageCode = "zh-cn"
+title = "TechLog 技术日志"
+theme = "PaperMod"
+enableRobotsTXT = true
+enableEmoji = true
+
+[homeInfoParams]
+  Title = "TechLog 技术日志"
+  Content = "记录日常技术运维与情报追踪：内核版本、软件更新、价格变动、硬件调研。"
+
+[params]
+  env = "production"
+  description = "IT 运维与技术情报日志：内核跟踪、软件更新、价格变动、硬件调研"
+  keywords = ["运维", "Linux", "Kylin", "Caddy", "技术日志"]
+  defaultTheme = "light"
+  disableThemeToggle = false
+  ShowReadingTime = true
+  ShowShareButtons = false
+  ShowPostNavLinks = true
+  ShowBreadCrumbs = true
+  ShowCodeCopyButtons = true
+  hideFooter = false
+  comments = false
+  dateFormat = "2006-01-02"
+
+[[menu.main]]
+  identifier = "archives"
+  name = "归档"
+  url = "/archives/"
+  weight = 10
+
+[[menu.main]]
+  identifier = "search"
+  name = "搜索"
+  url = "/search/"
+  weight = 20
+
+[[menu.main]]
+  identifier = "tags"
+  name = "标签"
+  url = "/tags/"
+  weight = 30
+
+[outputs]
+  home = ["HTML", "RSS", "JSON"]
+
+[markup.highlight]
+  noClasses = false
