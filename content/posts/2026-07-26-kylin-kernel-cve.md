@@ -6,8 +6,6 @@ categories: ["安全更新"]
 draft: false
 ---
 
-# Kylin V10SP1 内核 23.67→23.72 漏洞修复追踪
-
 > 记录于 2026-07-26。数据来源:麒麟官方 updateinfo.xml(update.cs2c.com.cn),所有 CVE 均可通过麒麟安全中心核实。
 
 ## 背景

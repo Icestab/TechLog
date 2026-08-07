@@ -6,8 +6,6 @@ categories: ["技术实践"]
 draft: false
 ---
 
-# Firecrawl 计费陷阱:PDF 提取按页计费
-
 > 一次 82 页 PDF 提取烧掉 84 credits(月度免费额度的 8.4%),血的教训。
 
 ## 计费规则(官方确认)

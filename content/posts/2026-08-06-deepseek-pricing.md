@@ -6,8 +6,6 @@ categories: ["AI 动态"]
 draft: false
 ---
 
-# DeepSeek API 大幅涨价预告与峰谷定价
-
 > 2026-08-06,DeepSeek 在开发者后台发布涨价提示,多家媒体(东方财富/新浪财经/界面等)同日报道。
 
 ## 核心信息
