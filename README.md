@@ -9,5 +9,6 @@ IT 运维与技术情报日志:内核跟踪、软件更新、AI 价格变动、�
 ## 本地开发
 
 ```bash
-hugo server --bind 0.0.0.0 --port 8642 --baseURL http://<宿主机IP>:8642/
+hugo server
+# 默认 http://localhost:1313
 ```
