@@ -1,4 +1,4 @@
-baseURL = "https://example.github.io/techlog/"
+baseURL = "https://icestab.github.io/TechLog/"
 languageCode = "zh-cn"
 title = "TechLog 技术日志"
 theme = "PaperMod"
