@@ -3,7 +3,7 @@ title: "zram 部署踩坑：memory-limit 不是你以为的那个 limit"
 date: 2026-10-15T11:00:00+08:00
 draft: false
 description: "4GB 小主机 swap 吃满，想上 zram 分层却一个单元文件都没生成——根因是 memory-limit 是 host-memory-limit 的废弃别名，语义是「机器内存超过这个数就别创建设备」。"
-tags: ["zram", "swap", "内存", "小主机", "Debian", "systemd", "lz4", "运维"]
+tags: ["zram", "swap", "内存", "小主机", "Debian", "systemd", "lz4", "sysctl", "vm.swappiness", "运维"]
 categories: ["踩坑记录"]
 ---
 
@@ -338,14 +338,14 @@ swap-priority = 100
 
 三个参数的理由：
 
-- **`zram-size = 1024`**：zram 的 `disksize` 是**懒分配的虚拟上限**（没有页换出时占 0 真实内存），所以它不是「预留」。但**最坏情况真实占用 ≈ disksize**（数据完全不可压缩时）。按实测 2.83x 折算：
+- **`zram-size = 1024`**：zram 的 `disksize` 是**懒分配的虚拟上限**（没有页换出时占 0 真实内存），所以它不是「预留」。但**最坏情况真实占用 ≈ disksize**（数据完全不可压缩时）。注意 `disksize` 限的是**未压缩逻辑容量**（ArchWiki 原话：controls the maximum *uncompressed* amount of data it can store, not the maximum compressed size），与压缩比无关，真实内存占用 = 逻辑量 ÷ 压缩比。按实测 2.83x 折算：
 
-  | disksize | 能吸收的原始页（2.83x） | 真实内存占用：典型(2.83x) / 最坏(不可压缩) |
+  | disksize | 能吸收的原始页（= disksize，与压缩比无关） | 真实内存占用：典型(2.83x) / 最坏(不可压缩) |
   |---|---|---|
-  | **1024 MB（最终采用）** | **~2.8 GB** | **~362 MB / 1024 MB** |
-  | 1536 MB | ~4.3 GB | ~543 MB / 1536 MB |
+  | **1024 MB（最终采用）** | **~1.0 GB** | **~362 MB / 1024 MB** |
+  | 1536 MB | ~1.5 GB | ~543 MB / 1536 MB |
 
-  当时 swap 只用了 942MB，1024 的容量绰绰有余，同时把最坏情况的风险砍掉三分之一。
+  当时 swap 只用了 942MB（逻辑量），1024 的容量绰绰有余，同时把最坏情况的风险砍掉三分之一。
 
 - **`compression-algorithm = lz4`**：见第四节实测，lz4 在无 AVX 的 CPU 上是唯一划算的选择。**同时这也避开了「内核默认 lzo-rle 但 lzo 模块缺失」那个坑。**
 
@@ -370,6 +370,75 @@ sudo systemctl start dev-zram0.swap
 - `daemon-reload` 会重跑 generator，把正确的单元生成到 `/run/systemd/generator/`
 - `reset-failed` 清掉之前的 failed 状态（否则 start 可能被拦）
 - `start dev-zram0.swap` 会通过 `Requires=` 先把 `systemd-zram-setup@zram0.service` 拉起来（它执行 `zram-generator --setup-device zram0`，负责写 sysfs：算法 → disksize），然后 `swapon`
+
+### 7.3 第二轮：配套的内核 vm 调参（发布后追加）
+
+zram 只把「快的层」建起来；下面这组 sysctl 决定**压力来临时内核怎么用它**。
+
+来源是 ArchWiki «zram» → "Optimizing swap on zram" 的标准四件套（该节注明 "These values are what Pop!_OS uses"）：
+
+```ini
+vm.swappiness = 180          # ← ArchWiki 原值
+vm.watermark_boost_factor = 0
+vm.watermark_scale_factor = 125
+vm.page-cluster = 0
+```
+
+**本机刻意把 swappiness 从 180 改成 100**（理由见下）。最终 `/etc/sysctl.d/99-zram.conf`：
+
+```ini
+vm.swappiness = 100
+vm.page-cluster = 0
+vm.watermark_boost_factor = 0
+vm.watermark_scale_factor = 125
+```
+
+逐条机理与依据：
+
+| 参数 | 本机默认 | 设为 | 依据 |
+|---|---|---|---|
+| `vm.swappiness` | 60 | **100** | 内核文档：定义「swap 与文件系统分页的相对 IO 成本」，0-200。**"At 100, the VM assumes equal IO cost"** |
+| `vm.page-cluster` | 3 | **0** | 内核文档：默认 3 = 一次换入 2³=8 页=32KB。**"Zero disables swap readahead"** |
+| `vm.watermark_boost_factor` | 15000 | **0** | Ubuntu upstream 补丁 "prevent swap storms by disabling high watermark boosting" |
+| `vm.watermark_scale_factor` | 10 | **125** | 拉开 min/low/high 水位间距，让 kswapd 提前、平滑回收 |
+
+**`page-cluster = 0` 为什么对 zram 特别有意义**：zram 没有寻道成本，一次批量读 8 页只会让 CPU 白解压用不到的页（本机 lz4 解压 1127 MB/s，省下的都是净赚）。Fedora 的讨论串说得直白：`page-cluster=3` 是给 HDD/SSD 设计的，套在内存压缩块设备上就是「做多余的读、白烧 CPU 解压」。
+
+**`watermark_boost_factor = 0` 是这四条里对本机价值最高的**，因为背书最硬。Ubuntu 的 SRU 补丁描述：
+
+> High watermark boosting can cause **large swap activity** under certain memory intensive workloads, making the system **very unresponsive (screen does not refresh, keyboard not responding, etc.)**. This large swap activity seems to be prevented disabling high watermark boosting.
+
+Debian 邮件列表里另有一条实测：
+
+> Tuning vm.watermark_boost_factor to 0 (disable) on Debian significantly improves performance on memory-intensive tasks that utilise SWAP space, by stopping preemptive kswapd freeing of memory, and subsequent **page thrashing**.
+
+**——这恰好就是本次事故的症状**（load average 冲到 37、所有服务请求超时约 15 分钟，见第一节与第九节）。Ubuntu 后来把它做成了默认值。
+
+**为什么 swappiness 用 100 而不是 ArchWiki 的 180**：180 是在赌「swap IO 几乎免费」，前提是 **swap 全是 zram**。本机是「zram 1G 快层 + 慢盘 975M 溢出层」的两层结构，而 kernel 的 `swappiness` 是**全局的、分不清 swap 设备**。一旦 zram 满了、溢出到那块低端 SSD，180 会让内核继续积极地把页往慢盘推。100 的含义是「swap 和文件系统的 IO 成本相当」，在「快层有限量 + 慢层兜底」的拓扑下是更稳的假设。
+
+**应用**（我用的是 fish，fish 没有 heredoc，所以是「先落文件再 cp」）：
+
+```fish
+sudo cp 99-zram.conf /etc/sysctl.d/99-zram.conf && sudo sysctl --system
+```
+
+另一个容易被静默跳过的细节：**systemd-sysctl 会忽略「非 root 属主」或「他人可写」的配置文件**。
+
+```fish
+sudo chown root:root /etc/sysctl.d/99-zram.conf; sudo chmod 644 /etc/sysctl.d/99-zram.conf
+```
+
+**验证**（`sysctl` 接多个 key 会一起打印）：
+
+```fish
+sudo sysctl vm.swappiness vm.page-cluster vm.watermark_boost_factor vm.watermark_scale_factor
+vm.swappiness = 100
+vm.page-cluster = 0
+vm.watermark_boost_factor = 0
+vm.watermark_scale_factor = 125
+```
+
+**验证方式是「看压力下的表现」，不是「看稳态数字」** —— 这四条只在内存压力出现时才起作用，而应用当时 `/proc/pressure/memory` 三个窗口全是 0.00，所以各项稳态指标纹丝不动（预期内，不代表没生效）。
 
 ## 八、验证
 
@@ -451,10 +520,33 @@ awk '{printf "逻辑 %.1f MB   实际占RAM %.1f MB   压缩比 %.2fx\n", $1/104
 
 顺带一个细节：`mem_used_total = 4096` 而 `compr_data_size = 69` —— zsmalloc 按整页分配，69 字节也占满一页。数据量上来后会摊薄，但意味着**不能拿早期的 `mem_used_total` 去推算压缩比**。
 
-### 8.5 留给后续的验收点
+### 8.5 真实运行数据（发布后补充——回收 8.4 的悬念）
 
-- 下次重启后 `swapon --show` 里 sda5 的 USED 应接近 0。如果它又涨到几百 MB，说明 zram 满了，要调大 `zram-size`
-- 24 小时后回看 `mm_stat` 第 1/2 列，得到这台机器的真实压缩比，再决定 1024 选得对不对
+早先「只有 1 页数据、压缩比不可采信」的悬念可以回收了。zram 稳定运行后：
+
+```
+$ swapon --show
+NAME       TYPE      SIZE   USED PRIO
+/dev/sda5  partition  975M 845.4M   -2
+/dev/zram0 partition    1G 417.6M  100
+
+$ awk '...' /sys/block/zram0/mm_stat
+逻辑 407.6 MB  压缩后 136.0 MB  实占RAM 144.5 MB  压缩比 3.00x
+```
+
+**三个结论：**
+
+1. **生产环境真实压缩比 `2.98x ~ 3.00x`**，与第四节用合成 JSON 数据实测的 2.83x 很接近、略好。这个数字直接验证了 `zram-size = 1024` 选得对：
+   - 3x ⇒ 1024MB 的 zram 能吸收约 **1GB 逻辑页**（= disksize），对应真实内存占用典型 **~341MB**、最坏（不可压缩）≈1024MB
+   - 实际只用了 144.5MB 真实内存就装着 407.6MB 逻辑页，还有充裕余量
+2. **zram 确实在工作**，不是摆设：`USED 417.6M`、逻辑 407.6MB，都在动。
+3. **sda5 从 942MB 掉到 845MB** —— 坑清单第 4 条预测的「自然迁移」应验了：被访问过的页换入内存后，下次换出会走优先级更高的 zram，所以旧页在**不需要任何手动操作**的情况下慢慢往 zram 迁。这比预期更好，因为第 4 条当时预测的迁移触发条件是重启。
+
+### 8.6 仍然待观察
+
+- **验收点**：下次重启后 `swapon --show` 里 sda5 的 USED 应接近 0。如果它又涨到几百 MB，说明 zram 满了，要调大 `zram-size`。
+- **vm 调参的效果无法归因**：7.3 节那四条只在内存压力出现时才起作用，要验证只能挂长期采样记录下一次压力事件的表现。但即便变好，也很难归因到具体哪一条 —— 所以本文只把它们记成「有依据的预防性调整」，不声称「已验证有效」。
+- 压力事件是瞬时的，事后查不出来。当时考虑过挂一个每 5 分钟采样 pressure / swap 分层 / load / zram 压缩比的 systemd timer，最后没做。
 
 ## 九、我在同一天造的第二场事故
 
@@ -486,12 +578,28 @@ $ uptime
 6. **dashboard 的 Chat 标签页 = 一个 310MB 常驻进程**：PTY keep-alive、断开后 30 分钟才回收，托管模式下 `/quit` 被禁用、空闲 Ctrl+C 只会开新会话，`max_sessions=16` 是硬编码的。要立刻回收只能 `docker exec hermes kill <pid>`（宿主机上这些进程 uid=10000，普通用户没权限直接 kill）。
 7. **zram 不落盘、可回滚**：删掉或改名 `/etc/systemd/zram-generator.conf` → `daemon-reload` → `swapoff /dev/zram0` → `systemctl stop systemd-zram-setup@zram0.service`；也可以用内核参数 `systemd.zram=0` 或把 generator 软链到 `/dev/null`。
 
+8. **`sysctl --system` 只负责「应用」，不负责「恢复」**。改完 `/etc/sysctl.d/*.conf` 后 `sysctl --system` 会立刻把值写进内核，但**回滚时删掉文件再跑一次 `sysctl --system` 是没用的**——它只应用「现在存在的配置」，不会把运行时值还原成内核默认。真正回滚要显式写回：
+
+   ```fish
+   sudo rm /etc/sysctl.d/99-zram.conf
+   echo 60    | sudo tee /proc/sys/vm/swappiness
+   echo 3     | sudo tee /proc/sys/vm/page-cluster
+   echo 15000 | sudo tee /proc/sys/vm/watermark_boost_factor
+   echo 10    | sudo tee /proc/sys/vm/watermark_scale_factor
+   ```
+
+   同类陷阱：`sysctl --system` 也**不会报错**告诉你某个文件被跳过了。如果值没生效，先检查属主和权限（见 7.3）。
+
 ## 十一、可迁移的结论
 
 1. **小内存机器上，`mem_limit` 是「给应用装自保机制」的开关，不只是围栏。** 很多框架（这里的 hermes 就是）的「内存压力 → 自我卸载」阈值是从 cgroup 限制按比例推导的。容器不设限制 → 阈值按物理内存算 → 在共享机器上永远触发不了 → 自保机制等于没有。**先设限制，再做别的优化。**
 2. **选压缩算法要按 CPU 实测，不能按压缩比选。** 在这类「阉割 AVX 的 Skylake 世代 Pentium/Celeron」上，zstd 的压缩比优势（5.19x vs 2.83x）抵不过它的 CPU 代价（65 MB/s vs 315 MB/s）。判断标准应该是「换出速率 × CPU 单核时间」。**顺带：选任何 SIMD 敏感的软件栈前，先查 `/proc/cpuinfo` 里有没有 AVX。**
 3. **systemd generator 可以「干跑预检」。** `/lib/systemd/system-generators/<name> <dir> <dir> <dir>` 以普通用户身份就能跑，输出到临时目录、不碰系统。改配置前先跑一遍，等于给配置改动加了个零风险编译期检查——对 zram-generator、systemd-gpt-auto-generator 等所有 generator 都适用。
 4. **`free` 的 Swap 行只给总量和逻辑用量。** 要做分层（快/慢 swap）诊断，必须看 `swapon --show` 的 per-device 用量，加上设备自己的统计（zram 看 `mm_stat`）。
+
+5. **给 zram 配的 sysctl 是一组「压力下的行为参数」，不是「稳态性能参数」。** 它们只在内存压力出现时才起作用，所以应用前后稳态数字不变是**正常的**，不能据此判断「没用」。验证它们的唯一方式是记录压力事件本身 —— 而压力事件是瞬时的、事后查不出来，所以如果不预先挂采样，就等于放弃了验证机会。（本文就是没挂采样，所以对效果只能存疑。）
+
+6. **抄 zram 调参时要注意「单层还是多层 swap」。** ArchWiki / Pop!_OS 那套值（`swappiness=180`）的前提是 swap 全是 zram；一旦你的 swap 是「zram + 磁盘」两层，`swappiness` 是全局的、分不清设备，180 会把页积极推向那个可能很慢的磁盘层。改成 100（内核文档的 "equal IO cost"）在多层级更稳。
 
 ## 十二、谁该这么干，谁不该
 
