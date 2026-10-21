@@ -15,7 +15,7 @@ categories: ["踩坑记录"]
 POST /admin/login  →  401 {"detail":"密码错误"}
 ```
 
-于是就有了这次从库里把口令捞回来的排查。本来到「字典命中」就该结束了，结果中途又栽进一个更值得写的岔子——找回口令 4 分钟后，会话全没了，症状和「口令错」一模一样。最后还顺手把这个快递柜改造成了博客素材的跨机器传送带。
+于是就有了这次从库里把口令捞回来的排查。本来到「字典命中」就该结束了，结果中途又栽进一个更值得写的岔子——找回口令 46 秒后，会话全没了，症状和「口令错」一模一样。最后还顺手把这个快递柜改造成了博客素材的跨机器传送带。
 
 ## 一、排查：从环境变量翻到 SQLite
 
@@ -100,7 +100,7 @@ POST /admin/login {"password":"<命中的串>"}
 
 到这里，按理说就该收工了。
 
-## 二、岔子：找回口令 4 分钟后，会话全没了
+## 二、岔子：找回口令 46 秒后，会话全没了
 
 排查过程中我做了一次只读的「现状快照」，几分钟后这个快照就对不上了：`settings` 里的 `admin_token` 换成了一个**新的 scrypt 哈希**，`jwt_secret` 也变了。
 
@@ -256,13 +256,13 @@ curl -s -X POST https://<反代域名>/share/file/ \
   -F "file=@2026-10-20-xxx.md" -F expire_value=7 -F expire_style=day
 # → {"code":200,"message":"ok","detail":{"code":"<取件码>","name":"2026-10-20-xxx.md"}}
 
-# 取：select 拿直链（key 是必填参数）
-curl -s -X POST https://<反代域名>/share/select/ \
-  -H 'Content-Type: application/json' -d '{"code":"<取件码>"}'
-# → "download_url":"/share/download?key=<64位hex>&code=<取件码>"
-
-# 下载
-curl -fsS -o /tmp/material.md 'https://<反代域名>/share/download?key=<64位hex>&code=<取件码>'
+# 取：每次先 select 现换一个 key 再下载——直链只有约 17～33 分钟寿命，
+# 不能缓存复用（key 按 1000 秒时间窗签名，机制见第六节）
+U=$(curl -s -X POST https://<反代域名>/share/select/ \
+      -H 'Content-Type: application/json' -d '{"code":"<取件码>"}' \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin)["detail"]["download_url"])')
+# → /share/download?key=<64位hex>&code=<取件码>
+curl -fsS -o /tmp/material.md "https://<反代域名>$U"
 ```
 
 顺手把它注册成 coding agent 自己的 MCP server（streamable HTTP，免鉴权）：
@@ -310,7 +310,33 @@ $ mv  …/blog-inbox/inbox/2026-10-20-xxx.md …/blog-inbox/done/   # 挪成功
 
 - `GET /share/download` **缺 key 会 422**（`{"type":"missing","loc":["query","key"]}`）——所以不能只凭取件码 wget，得先 select 拿 key。
 - **`select` 不消耗下载次数**：`expire_style=count, expire_value=1` 时，select 三次后 `used_count` 仍是 0、`remaining_downloads` 仍是 1；真正消耗的是 `download`。
-- **`key` 对同一份分享是稳定的**：连续 select 三次拿到同一个 key，直链可以缓存复用，过期前重复下载都成功。
+- **下载直链里的 `key` 是限时的——这正是最初判错、本次订正的地方。** 起初在同一分钟内连调三次 select，拿到的 key 每次都一模一样，于是我得出「key 稳定、直链可缓存」的结论，还写进了交接说明；第二天再拿同一条直链去取，得到 `403 {"code":403,"detail":"下载鉴权失败"}`（旧直链隔天实测仍是 403）。
+
+  翻源码才看到真相（`core/utils.py`）：
+
+  ```python
+  async def get_select_token(code: str, offset: int = 0):
+      jwt = getattr(settings, "jwt_secret", "")     # 会话密钥
+      # 每个窗口约 1000 秒；offset 允许校验上一窗口，避免边界竞态
+      time_factor = int(time.time() / 1000) - max(0, int(offset))
+      return hashlib.sha256(f"{code}{time_factor}000{jwt}".encode()).hexdigest()
+  ```
+
+  而下载入口只接受**当前与上一个窗口**的 token（`apps/base/views.py`）：
+
+  ```python
+  valid_keys = [
+      await get_select_token(normalized_code, offset=0),
+      await get_select_token(normalized_code, offset=1),
+  ]
+  if not any(hmac.compare_digest(key.encode(), c.encode()) for c in valid_keys):
+      ip_limit["error"].add_ip(ip)
+      raise HTTPException(status_code=403, detail="下载鉴权失败")
+  ```
+
+  拿真实数据把窗口算回来也对得上：上传时刻 17:38:57 落在窗口 1792489，用当时的取件码反算出的 sha256 与旧直链印的 key 完全一致；次日当前窗口 1792569 算出的是另一个值，旧 key 已不在任何有效窗口。
+
+  **结论：一条直链的寿命是 1000～2000 秒（约 17～33 分钟），到期必须重新 select 换 key；取件码本身存在 `filecodes` 表里，长期有效，不受时间窗影响。** 同窗内重复 select 看到同一个 key 属正常——为什么归纳会骗人，见第八节第 5 条。
 
 ## 七、坑与注意点
 
@@ -325,6 +351,7 @@ $ mv  …/blog-inbox/inbox/2026-10-20-xxx.md …/blog-inbox/done/   # 挪成功
   ```
 
   **所以 `curl -o material.md <url>` 会把这段错误 JSON 原样写进素材文件，`curl -f` 也不会失败。** 取完必须确认拿到的是正文。这是这条通道最阴的坑。
+- **403 `{"detail":"下载鉴权失败"}` = key 过期，不是素材丢了**——重新 select 换一条直链就能下。而且 403 会计入 IP 限流（`ip_limit["error"]`，默认 `error_count=10` / `error_minute=1`），拿过期链接反复重试等于自己把自己短暂拉黑，别这么做。
 - **`share_text` 没有下载直链**：它的 `download_url` 是 `null`，文本只能走 `POST /share/select/` 取 `detail.text`，wget/curl 拉不了。要可下载、要保留文件名，就必须用 `share_file`。
 - **容器里通常没有 wget**：`curl` 有、`wget` 没有，给消费端的取件命令要写 curl。
 - **升级前先备份**：fcb 的数据在**命名卷**里，不在 compose 目录，任何「按目录备份」的脚本都覆盖不到它：
@@ -344,3 +371,4 @@ $ mv  …/blog-inbox/inbox/2026-10-20-xxx.md …/blog-inbox/done/   # 挪成功
 2. **「保存设置」触发会话密钥轮换，是把用户锁在门外的经典设计坑**。它和「凭证错误」的表象完全重合——排这类问题时，先建立「写操作」与「认证失败」的时间相关性，再下结论，靠错误码会一直猜错。
 3. **别用间接信号推断服务的可达性**。域名带真 TLS 证书 ≠ 在公网（本例公网 DNS 直接返回内网地址）；有 compose 有容器 ≠ 消费端能连上（本例跨 bridge 网络、没发布端口，但经反代是通的）。两个方向都得实测：查公共 DNS 的实际 A 记录，再从目标容器里带 `%{http_code} %{remote_ip}` 真跑一次。
 4. **把「传输」和「账本」分开设计**。传输层可以选任何易失的东西（取件码、TTL、一次性），账本（已发布/未发布、修订历史）留在需要长期持有的那一侧的文件系统里。这样换传输方式时不需要重做状态机，也不会出现「两边记账不一致」。
+5. **同一时间窗内的重复观测，会骗你相信一个值是恒定的。** 连续三次 select 拿到同一个 `key`，就断定「key 稳定、直链可缓存」，还写进了交接说明；真相是它每 1000 秒换一次，第二天直接 403。教训有两层：凡是看起来像「常量」的令牌/签名/链接，背后一定有窗口或过期参数——**先去源码找那个参数**，而不要靠多次观测归纳；要验证时效性，唯一有效的办法是**跨过时间边界再测一次**，同窗内的样本再多也没有信息量。还有一个附带结论：这类 token 常常拿服务端密钥签名（本例是 `jwt_secret`），于是「改个无关设置」就能把在途链接全作废，排查时要想到这条连带关系。
