@@ -213,13 +213,23 @@ newapi.<域名> {
 | 硅基流动 | SiliconFlow(40) | `https://api.siliconflow.cn/v1` | `Qwen/Qwen3-Reranker-0.6B` | — |
 | 阿里百炼 | OpenAI | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen3.7-text-embedding` | — |
 
-opencode 渠道的请求头覆盖：
+opencode 渠道的请求头覆盖（2026-11-09 补全为三个头）：
 
 ```json
-{"x-opencode-session": "{client_header:x-opencode-session}"}
+{"x-opencode-session": "{client_header:x-opencode-session}",
+ "User-Agent": "{client_header:user-agent}",
+ "x-opencode-client": "{client_header:x-opencode-client}"}
 ```
 
 控制台里的「请求头覆盖」与「透传请求头」开关**是同一份 `header_override` 配置的两个入口**（开关的勾选状态由 JSON 解析得出，JSON 坏了开关变灰并报 `Fix the Request Header Override JSON first`）。开关一键写入的是内置 Codex / Claude Code 头模板，**不含 opencode 的头**，所以这个渠道必须手写 JSON。opencode 官方自 2026-09-06 起强制要求 `x-opencode-session`（缺失报错），该头用于 prompt cache 的会话路由。
+
+这里有个容易被名字骗了的机制：**网关的「透传」是白名单，不是全量转发**。出站请求头由网关重新组装，除 `Content-Type`、`Accept` 这类基础头外一律不带——想让上游看到哪个头，就得在覆盖 JSON 里逐条写 `{client_header:名字}`，把入站请求头的值取出来。opencode 官方的接入要求恰好是「自报身份 + 会话粘连」两件事：`User-Agent` 别用通用 HTTP 库的名字，`x-opencode-session` 每个会话一个稳定值；`x-opencode-client` 是客户端名字位（官方 CLI 发 `cli`/`desktop`，第三方按惯例填自己的短名，如 `pi`），给上游的用量统计归因用。
+
+三个行为细节：
+
+- 客户端没带某个头时，对应那一行**整条不下发**（源码 `relay/channel/api_request.go` 里空值直接省略），占位符也没有「取不到就填默认值」的回退语法——上游问题单 7818 提的正是这个缺口：缺会话头会被上游 400，想要 `{client_header:名字|回退值}` 兜底，目前没有。
+- 转发时的跳过清单只排除凭据类（`authorization`、`x-api-key`、`cookie`）和逐跳头（`connection`、`transfer-encoding` 等），`user-agent` 不在其中，可以正常透。
+- 客户端侧也得真的带上这些头：pi 内置就会发会话头，身份头要在客户端配置里加；hermes 这类客户端把请求头烘进客户端初始化并进程内缓存，改完配置要重启客户端才生效，不会热补。
 
 ### 4. 定价：美元入库
 
@@ -277,7 +287,7 @@ $ docker exec postgres psql -U postgres -d newapi -Atc \
 16 | 96701 | 1293 | 1301  | 95104
 ```
 
-- **99.8% 的 `cache_tokens / prompt_tokens`** 说明 opencode 按 `x-opencode-session` 精准路由到了同一 cache 分片——**透传生效的铁证**（头部实测 `x-opencode-session: <pi会话UUID>`，`user-agent: Go-http-client/1.1` 是网关出站身份）。
+- **99.8% 的 `cache_tokens / prompt_tokens`** 说明 opencode 按 `x-opencode-session` 精准路由到了同一 cache 分片——**会话头透传生效的铁证**（头部实测 `x-opencode-session: <pi会话UUID>`；当时 `user-agent: Go-http-client/1.1` 还是网关自己的出站身份，说明身份头当时没透——2026-11-09 补上 `User-Agent` 与 `x-opencode-client` 的透传后才完整，见四.3）。
 - 这天 deepseek 正常完成的部分合计 17,597 quota，其中首条冷启动一条就占 14,103（80%），之后每轮只有几百——**长会话越聊越便宜**，冷启动才是成本大头。
 
 ### 2. 四渠道当日统计
@@ -307,6 +317,7 @@ $ docker exec postgres psql -U postgres -d newapi -Atc \
 8. 网关按客户端分 token：pi 与 Hindsight 各持一把网关令牌，日志里 `token_name` 直接分账；**Hindsight 是无人值守服务，令牌额度必须无限、无过期**，否则后台记忆任务会静默失败。
 9. 备份习惯：每次改 compose / `.env` 前 `cp` 日期后缀备份，密钥文件 600、目录 700。
 10. 上游 key 收敛后：渠道 key 与客户端旧 key 本就不同，吊销旧 key 不影响网关；吊销后散落在各备份里的副本自动变成死值——这正是收敛 + 吊销的收益。
+11. **「透传」这个词别按字面理解**：网关出站默认只发基础头，客户端带来的头要逐条写进 `header_override` 才会上游；会话头、身份头这类「软头」漏配不报错，代价是上游把你当匿名客户端——会话粘连失效、用量统计归因不到，而且现象只在缓存命中率和上游后台里看得出来。空值占位符整条不下发、没有回退语法，客户端可能不带某头的场景要留意。
 
 ## 七、可迁移的结论
 
@@ -315,5 +326,7 @@ $ docker exec postgres psql -U postgres -d newapi -Atc \
 **对账类问题先拆结构再下结论。** 「统计多收了」这一天的账按 `end_reason` 拆成正常/异常两类后，84% 的偏差集中在一类异常行上，单条根因随后在上游 issue 里找到原文——先 SQL 拆账、再查上游 issue、最后才怀疑自己的配置。这次的顺序救了我：如果先去翻自己的定价配置，会白查一天。
 
 **会话粘连型客户端最值钱的验证指标是缓存命中率。** 99.8% 的命中率同时证明了「头透传生效」和「计费路径正确」，比任何日志文案都硬；反过来，客户端中断是缓存统计与计费的最大破坏者——一次手滑的 8 次 Esc 就制造了全天 84% 的虚账。
+
+**网关层的「透传」要当成白名单来配。** 出站请求头是重新组装的，客户端身份越具体（用户代理、客户端名、会话 ID），上游能给的优化就越多——缓存路由和用量归因都吃这些头；漏配不会报错，只会静默降级成匿名流量。配套地，客户端侧也得真带上这些头，而且客户端通常把请求头烘进初始化阶段缓存，改完要重启才生效。
 
 取舍上：**上游 key 数量少、只想统一记账的个人用户**，直接单容器 + PG/SQLite + Caddy 就够，不必照搬生产模板里的 Redis（多实例共享状态才用得上）；**多 key 多客户端、需要按客户端分账**的场景，网关的 `token_name` 分账和 `header_override` 才真正值钱。反过来，如果你只是偶尔调一两个模型、也不在乎分账，继续在各客户端各持一把 key 更省事——这次的全部复杂度（定价、汇率、渠道测试、虚账对账）都是为「收敛」付的代价。
